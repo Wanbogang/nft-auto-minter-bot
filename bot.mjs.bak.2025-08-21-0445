@@ -1,0 +1,154 @@
+import 'dotenv/config';
+import { ethers, Interface, Fragment } from 'ethers';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const env = (k, d = undefined) => (process.env[k] ?? d);
+function parseBool(x, d=false){ if (x === undefined) return d; return /^true$/i.test(String(x)); }
+function parsePercentInt(x, d){ const n = Number(x); return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : d; }
+function parseGwei(x, d){ if (!x) return d; try { return ethers.parseUnits(String(x), 'gwei'); } catch { return d; } }
+function mulBigIntDecimal(x, decimalStr='1.0', scale=1000n){ const [ip, fp=''] = String(decimalStr).split('.'); const frac = (fp + '0'.repeat(3)).slice(0,3); const m = BigInt(ip) * scale + BigInt(frac); return (x * m) / scale; }
+
+const HTTP_URL = env('ALCHEMY_HTTP_URL');
+const WSS_URL  = env('ALCHEMY_WSS_URL');
+const CHAIN_ID = Number(env('CHAIN_ID', '84532'));
+
+const CONTRACT_ADDRESS = env('CONTRACT_ADDRESS');
+const MINT_SIGNATURE   = env('MINT_SIGNATURE', 'function mint()');
+const MINT_ARGS        = JSON.parse(env('MINT_ARGS', '[]'));
+const MINT_VALUE_ETH   = env('MINT_VALUE_ETH', '0');
+
+const WAIT_FOR_CODE = parseBool(env('WAIT_FOR_CODE', 'true'), true);
+const DRY_RUN       = parseBool(env('DRY_RUN', 'true'), true);
+
+const GAS_LIMIT_PAD_PERCENT = parsePercentInt(env('GAS_LIMIT_PAD_PERCENT', '20'), 20);
+const MAX_PRIORITY_FEE_GWEI = parseGwei(env('MAX_PRIORITY_FEE_GWEI'), ethers.parseUnits('1.5', 'gwei'));
+const MAX_FEE_MULTIPLIER    = env('MAX_FEE_MULTIPLIER', '2.0');
+
+const REPLACEMENT_AFTER_SECONDS       = Number(env('REPLACEMENT_AFTER_SECONDS', '20'));
+const REPLACEMENT_PRIORITY_BUMP_GWEI  = env('REPLACEMENT_PRIORITY_BUMP_GWEI', '0.5');
+const MAX_REPLACEMENTS                = Math.max(0, Number(env('MAX_REPLACEMENTS', '3')));
+
+if (!HTTP_URL || !process.env.PRIVATE_KEY || !CONTRACT_ADDRESS) {
+  console.error('❌ Pastikan ALCHEMY_HTTP_URL, PRIVATE_KEY, dan CONTRACT_ADDRESS terisi di .env');
+  process.exit(1);
+}
+
+const httpProvider = new ethers.JsonRpcProvider(HTTP_URL, CHAIN_ID);
+let wsProvider = null;
+if (WSS_URL) {
+  try { wsProvider = new ethers.WebSocketProvider(WSS_URL, CHAIN_ID); }
+  catch (e) { console.warn('⚠️ Gagal init WebSocket, lanjut HTTP polling.'); }
+}
+const provider = wsProvider || httpProvider;
+const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, httpProvider);
+
+async function waitForContractDeployed(address) {
+  if (!WAIT_FOR_CODE) return;
+  process.stdout.write(`⏳ Menunggu kontrak ${address} ter-deploy...`);
+  for (;;) {
+    const code = await provider.getCode(address);
+    if (code && code !== '0x') break;
+    process.stdout.write('.');
+    await sleep(500);
+  }
+  console.log('\\n✅ Kontrak sudah live.');
+}
+
+async function buildTxData() {
+  const frag = Fragment.from(MINT_SIGNATURE.trim());
+  const iface = new Interface([frag]);
+  const fnName = frag.name;
+  const data = iface.encodeFunctionData(fnName, MINT_ARGS);
+  const value = ethers.parseEther(String(MINT_VALUE_ETH || '0'));
+  return { data, value, fnName, iface };
+}
+
+async function computeFees(attempt = 0) {
+  const latest = await provider.getBlock('latest');
+  const base = latest.baseFeePerGas ?? ethers.parseUnits('0', 'gwei');
+  let maxPriority = MAX_PRIORITY_FEE_GWEI;
+  if (attempt > 0) {
+    const bump = parseGwei(String(REPLACEMENT_PRIORITY_BUMP_GWEI), ethers.parseUnits('0', 'gwei')) * BigInt(attempt);
+    maxPriority += bump;
+  }
+  const maxFee = mulBigIntDecimal(base, MAX_FEE_MULTIPLIER) + maxPriority;
+  return { maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority };
+}
+
+async function estimateGasLimit(txReq) {
+  const est = await httpProvider.estimateGas({
+    from: wallet.address, to: CONTRACT_ADDRESS, data: txReq.data, value: txReq.value,
+  });
+  const pad = 100n + BigInt(GAS_LIMIT_PAD_PERCENT);
+  return (est * pad) / 100n;
+}
+
+async function simulateCall(fnName) {
+  const contract = new ethers.Contract(CONTRACT_ADDRESS, [Fragment.from(MINT_SIGNATURE)], httpProvider).connect(wallet);
+  const fn = contract.getFunction(fnName);
+  try { await fn.staticCall(...MINT_ARGS, { value: ethers.parseEther(String(MINT_VALUE_ETH || '0')) }); return { ok: true }; }
+  catch (e) { return { ok: false, error: e?.shortMessage || e?.message || String(e) }; }
+}
+
+async function sendWithReplacements(baseTx) {
+  const nonce = await httpProvider.getTransactionCount(wallet.address, 'latest');
+  let attempt = 0;
+  for (;;) {
+    const fees = await computeFees(attempt);
+    const gasLimit = await estimateGasLimit(baseTx);
+    const tx = {
+      to: CONTRACT_ADDRESS, data: baseTx.data, value: baseTx.value, gasLimit,
+      maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+      nonce, chainId: CHAIN_ID, type: 2,
+    };
+    const sent = await wallet.sendTransaction(tx);
+    console.log(`🚀 Broadcast [attempt ${attempt + 1}] tx: ${sent.hash}`);
+    const deadline = Date.now() + REPLACEMENT_AFTER_SECONDS * 1000;
+    for (;;) {
+      const rcpt = await httpProvider.getTransactionReceipt(sent.hash);
+      if (rcpt) return rcpt;
+      if (Date.now() > deadline) break;
+      await sleep(1000);
+    }
+    attempt += 1;
+    if (attempt > MAX_REPLACEMENTS) throw new Error('Max replacement attempts reached without confirmation.');
+    console.log('⏫ Menaikkan fee & mengganti tx (nonce sama)...');
+  }
+}
+
+async function main() {
+  console.log('👋 NFT Bot Sniper — Base Sepolia');
+  console.log(`Wallet: ${wallet.address}`);
+  console.log(`RPC (HTTP): ${HTTP_URL}`);
+  if (wsProvider) console.log('WebSocket: OK');
+
+  await waitForContractDeployed(CONTRACT_ADDRESS);
+
+  const { data, value, fnName } = await buildTxData();
+
+  const sim = await simulateCall(fnName);
+  if (!sim.ok) {
+    console.error('❌ Simulasi gagal (callStatic). Pesan:\\n', sim.error);
+    if (!DRY_RUN) {
+      console.error('Hentikan atau set DRY_RUN=true untuk uji tanpa broadcast.');
+      process.exit(1);
+    }
+  } else {
+    console.log('✅ Simulasi ok (kemungkinan besar tx akan sukses).');
+  }
+
+  if (DRY_RUN) {
+    console.log('🧪 DRY_RUN aktif — tidak broadcast tx. Selesai.');
+    return;
+  }
+
+  const receipt = await sendWithReplacements({ data, value });
+  console.log('🎉 Sukses! Tx confirmed pada block', receipt.blockNumber);
+  console.log('Tx Hash (from receipt):', receipt.hash);
+  console.log('Tx Hash:', receipt.hash);
+}
+
+main().catch((e) => {
+  console.error('Fatal:', e?.shortMessage || e?.message || e);
+  process.exit(1);
+});
