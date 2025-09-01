@@ -1,6 +1,6 @@
 # NFT Auto-Minter Bot
 
-NFT Auto-Minter bot built on top of **Soundness Layer**, supporting Ethereum, Base, Arbitrum, and Polygon.
+NFT Auto-Minter bot built on top of **Soundness Layer**.
 
 ## ✨ Features
 - ✅ Integrated Soundness CLI precheck (key "gusjenggot")
